@@ -1,0 +1,7 @@
+web_data/
+__pycache__/
+*.pyc
+.DS_Store
+*.tmp
+logs/
+runs/
