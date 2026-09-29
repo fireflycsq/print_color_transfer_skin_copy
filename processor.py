@@ -5,7 +5,6 @@ import os
 import json
 import shutil
 import traceback
-import uuid
 import zlib
 import inspect
 import numpy as np
@@ -497,16 +496,6 @@ def _init_icc(cmyk_icc_path=_CMYK_ICC):
         _srgb_profile, _cmyk_profile, "RGB", "CMYK", _INTENT, _FLAGS)
     _cmyk_to_rgb = ImageCms.buildTransformFromOpenProfiles(
         _cmyk_profile, _srgb_profile, "CMYK", "RGB", _INTENT, _FLAGS)
-
-
-def _read_rgb(path):
-    _init_icc()
-    img = Image.open(path)
-    if img.mode == "CMYK":
-        img = ImageCms.applyTransform(img, _cmyk_to_rgb)
-    else:
-        img = img.convert("RGB")
-    return np.array(img, dtype=np.float32) / 255.0
 
 
 def _to_cmyk_pil(rgb_pil):
@@ -1300,17 +1289,6 @@ def _pdf_image_icc_bytes(image):
         return None
 
 
-# 向后兼容：老的曲线调整路径仍在调用 _read_embedded_cmyk
-def _read_embedded_cmyk(image):
-    """兼容层：只返回 CMYK 图像（若是 RGB/Gray 则返回 None）。"""
-    pil = _read_embedded_image_raw(image)
-    if pil is None or pil.mode != "CMYK":
-        if pil is not None:
-            pil.close()
-        return None
-    return pil
-
-
 def _raw_stream_bytes(obj) -> bytes | None:
     """
     从 pypdf 的 EncodedStreamObject 里拿原始字节流（未解压）。
@@ -1518,54 +1496,6 @@ def _restore_pdf_private_tail(src, dest):
         f.write(tail)
 
 
-# ============================================================
-# ★★★ 整页栅格化 fallback（绕开 pypdf 全部限制） ★★★
-# ============================================================
-
-def _rasterize_pdf_with_curves(src_pdf, dest_pdf, curves, dpi=None):
-    """整页栅格化 → 套 CMYK 曲线 → 重排 PDF。不依赖 pypdf。"""
-    if dpi is None:
-        try:
-            dpi = pdf_render_dpi(src_pdf)
-        except Exception:
-            dpi = PDF_DPI
-
-    dest_pdf = str(dest_pdf)
-    tmp_dir = Path(dest_pdf).parent / f".curve_raster_{uuid.uuid4().hex[:8]}"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    page_files, page_sizes = [], []
-    try:
-        total = 0
-        for i, (page_rgb, size_pt, _) in enumerate(iter_source_pages(src_pdf, dpi=dpi)):
-            try:
-                cmyk = _to_cmyk_pil(page_rgb)
-                try:
-                    cmyk = apply_cmyk_curves(cmyk, curves, content_only=False)
-                    page_path = tmp_dir / f"p{i}.tif"
-                    save_cmyk_image(cmyk, page_path, lossless=True)
-                    page_files.append(page_path)
-                    page_sizes.append(size_pt)
-                    total += 1
-                    print(f"   [栅格化] 第 {i + 1} 页完成")
-                finally:
-                    cmyk.close()
-            finally:
-                page_rgb.close()
-
-        if not page_files:
-            raise ValueError("PDF 无任何页面可栅格化")
-
-        save_cmyk_pdf(page_files, dest_pdf, dpi=dpi, page_sizes_pt=page_sizes)
-
-        if not os.path.exists(dest_pdf) or os.path.getsize(dest_pdf) == 0:
-            raise RuntimeError(f"栅格化输出无效: {dest_pdf}")
-
-        print(f"   [栅格化] 完成：{total} 页 @ {dpi:.0f} dpi → {dest_pdf}")
-        return dest_pdf
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-
-
 def apply_cmyk_curves_to_pdf(src, dest, curves):
     """在保留分层的 PDF 上套手工 CMYK 曲线。失败时抛出，由上层用整页 TIFF 重组。"""
     src, dest = str(src), str(dest)
@@ -1593,7 +1523,7 @@ def save_processed_image(pred_pil, path, as_cmyk=True):
     return path
 
 
-def _pil_to_bytes(pil_img, fmt="JPEG", quality=95):
+def pil_to_bytes(pil_img, fmt="JPEG", quality=95):
     buf = io.BytesIO()
     fmt_upper = fmt.upper()
     if fmt_upper == "JPEG":
@@ -1814,33 +1744,3 @@ def process_file(image_path, model, output_dir, output_filename=None,
 def load_first_page_rgb(path):
     page_rgb, _, _ = next(iter_source_pages(path))
     return np.asarray(page_rgb, dtype=np.uint8)
-
-
-def read_image(path, method="icc"):
-    if method == "icc":
-        return _read_rgb(path)
-    img = Image.open(path).convert("RGB")
-    return np.array(img, dtype=np.float32) / 255.0
-
-
-def process_image_pair(image_path, target_path=None, model=None,
-                       output_dir=None, inference_size=512,
-                       return_metrics=True, return_bytes=False,
-                       output_filename=None):
-    if model is None:
-        raise ValueError("必须提供已加载的模型")
-    if return_bytes:
-        img_rgb = _read_rgb(image_path)
-        pred, _ = _apply_curve_content(img_rgb, model)
-        pred_pil = Image.fromarray((pred * 255).astype(np.uint8), "RGB")
-        try:
-            cmyk = _to_cmyk_pil(pred_pil)
-            name = cmyk_container_name(output_filename or Path(image_path).name)
-            fmt = format_from_suffix(Path(name).suffix)
-            raw, mime = _pil_to_bytes(cmyk, fmt=fmt)
-            return {"rgb": {"bytes": raw, "mime": mime, "filename": name}}
-        finally:
-            pred_pil.close()
-    return process_file(image_path, model, output_dir or os.path.dirname(image_path),
-                        output_filename=output_filename, target_path=target_path,
-                        return_metrics=return_metrics)

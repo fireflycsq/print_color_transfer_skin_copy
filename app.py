@@ -4,26 +4,24 @@
 模型：CurvePredictor（v3，checkpoints/curve_pred_best.pth）
 输出：RGB 预览 + CMYK 印刷稿（PSOcoated_v3.icc）
 """
-import argparse, io, json, mimetypes, os, shutil, threading, time, uuid, zipfile, traceback
+import argparse, json, mimetypes, os, shutil, threading, uuid, zipfile, traceback
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
-import numpy as np
 from PIL import Image
 
-from processor import (process_file, load_model, read_image,
+from processor import (process_file, load_model,
                        apply_cmyk_curves, cmyk_to_srgb, curves_are_identity,
                        normalize_curves, save_cmyk_image, save_cmyk_pdf,
                        apply_cmyk_curves_to_pdf,
                        cmyk_container_name, is_pdf, pdf_page_count,
-                       load_first_page_rgb, _pil_to_bytes)
+                       load_first_page_rgb, pil_to_bytes)
 
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".pdf"}
-DEFAULT_MODEL = "checkpoints/curve_pred_best.pth"         # ★ v3 模型
+DEFAULT_MODEL = "checkpoints/curve_pred_best.pth"
 PROOF_SIZE = 1400          # 软打样底图边长，用于曲线面板实时预览
 PREVIEW_SIZE = 1600
 BATCH_DIRS = ("input", "input_preview", "output", "pages", "stages", "adjusted", "proof",
@@ -67,13 +65,10 @@ def unique_zip_name(filename, image_id, used):
     return f"{stem}_{image_id}{suffix}"
 
 
-safe_filename = original_filename
-
-
 class AppState:
     def __init__(self, model_path, data_dir, workers=2, max_upload_mb=512,
                  inference_size=512, pdf_dpi=300):
-        self.model = load_model(model_path)               # ★ CurvePredictor
+        self.model = load_model(model_path)
         self.model_path = Path(model_path)
         self.data_dir = Path(data_dir)
         self.max_upload_mb = max_upload_mb
@@ -85,7 +80,6 @@ class AppState:
         self.infer_lock = threading.Lock()
         self.executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="colour")
 
-    # ---- batch / manifest 逻辑：原样保留 ----
     def batch_dir(self, batch_id):
         if not batch_id.replace("-", "").isalnum():
             raise ValueError("非法批次 ID")
@@ -201,7 +195,6 @@ class AppState:
             self.write_batch(batch)
             return item.copy()
 
-    # ★★★ 核心：推理调用（曲线版）★★★
     def process_image(self, batch_id, image_id):
         item = self.update_item(batch_id, image_id, process_status="processing", error=None)
         root = self.batch_dir(batch_id)
@@ -411,7 +404,7 @@ class AppState:
             img.load()
             proofed = cmyk_to_srgb(apply_cmyk_curves(img, curves))
         proofed.thumbnail((size, size), Image.Resampling.LANCZOS)
-        raw, mime = _pil_to_bytes(proofed, fmt="JPEG", quality=88)
+        raw, mime = pil_to_bytes(proofed, fmt="JPEG", quality=88)
         return raw, mime, item["id"]
 
     def delivery_path(self, batch_id, item):
@@ -572,7 +565,6 @@ class Handler(BaseHTTPRequestHandler):
             elif len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "download":
                 status = parse_qs(parsed.query).get("status", ["approved"])[0]
                 self.send_file(self.app.make_zip(parts[2], status), f"{parts[2]}_{status}.zip")
-            # ★★★ 新增：单张图片下载端点 ★★★
             elif len(parts) == 5 and parts[:2] == ["api", "batches"] and parts[4] == "download":
                 batch_id, image_id = parts[2], parts[3]
                 fmt = parse_qs(parsed.query).get("format", ["original"])[0]
@@ -720,7 +712,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     ap = argparse.ArgumentParser(description="印刷调色 Web 服务（CurvePredictor v3）")
-    ap.add_argument("--model", default="checkpoints/curve_pred_best.pth", help="CurvePredictor 权重路径")   # ★ 默认改了
+    ap.add_argument("--model", default=DEFAULT_MODEL, help="CurvePredictor 权重路径")
     ap.add_argument("--data", default="web_data", help="数据存储目录")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=5001)
