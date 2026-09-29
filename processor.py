@@ -1160,7 +1160,40 @@ def _collect_writer_images(writer):
     print(f"   [PDF] 扫描 {total_pages} 页，找到 {len(images)} 张嵌入图")
     return images
 
+_icc_to_srgb_cache = {}
+
+
+def _transform_icc_to_srgb(icc_bytes, in_mode):
+    """用图像自带 ICC 建到 sRGB 的转换，同一份配置文件只建一次。"""
+    _init_icc()
+    key = (icc_bytes[:64], len(icc_bytes), icc_bytes[-64:], in_mode)
+    cached = _icc_to_srgb_cache.get(key)
+    if cached is not None:
+        return cached
+    profile = ImageCms.getOpenProfile(io.BytesIO(icc_bytes))
+    transform = ImageCms.buildTransformFromOpenProfiles(
+        profile, _srgb_profile, in_mode, "RGB", _INTENT, _FLAGS)
+    _icc_to_srgb_cache[key] = transform
+    return transform
+
+
+def _pil_icc_bytes(pil):
+    icc = pil.info.get("icc_profile") if getattr(pil, "info", None) else None
+    if isinstance(icc, str):
+        icc = icc.encode("latin-1")
+    return bytes(icc) if icc else None
+
+
 def _pil_to_model_rgb(pil):
+    """送到模型前的 sRGB。有自带 ICC 就用它，否则 CMYK 用 PSOcoated_v3。"""
+    icc = _pil_icc_bytes(pil)
+    mode = pil.mode if pil.mode in ("RGB", "CMYK", "L") else None
+    if icc and mode:
+        try:
+            rgb = ImageCms.applyTransform(pil, _transform_icc_to_srgb(icc, mode))
+            return np.asarray(rgb, dtype=np.float32) / 255.0
+        except Exception as exc:
+            print(f"   自带 ICC 转换失败，改用 PSOcoated_v3: {exc}")
     _init_icc()
     if pil.mode == "CMYK":
         rgb = ImageCms.applyTransform(pil, _cmyk_to_rgb)
@@ -1236,7 +1269,33 @@ def _read_embedded_image_raw(image):
         expected = w * h * n_channels
         if len(raw) < expected:
             return None
-        return Image.frombytes(mode, (w, h), raw[:expected])
+        img = Image.frombytes(mode, (w, h), raw[:expected])
+        if isinstance(cs, list) and str(cs[0]) == "/ICCBased":
+            icc_obj = cs[1].get_object() if isinstance(cs[1], IndirectObject) else cs[1]
+            icc = icc_obj.get_data() if hasattr(icc_obj, "get_data") else None
+            if isinstance(icc, str):
+                icc = icc.encode("latin-1")
+            if icc:
+                img.info["icc_profile"] = bytes(icc)
+        return img
+    except Exception:
+        return None
+
+
+def _pdf_image_icc_bytes(image):
+    """从嵌入图的 /ICCBased 色彩空间取出配置文件。Device* 没有。"""
+    from pypdf.generic import IndirectObject
+    try:
+        obj = image.indirect_reference.get_object()
+        cs = obj.get("/ColorSpace")
+        cs = cs.get_object() if isinstance(cs, IndirectObject) else cs
+        if not isinstance(cs, list) or str(cs[0]) != "/ICCBased":
+            return None
+        icc_obj = cs[1].get_object() if isinstance(cs[1], IndirectObject) else cs[1]
+        data = icc_obj.get_data() if hasattr(icc_obj, "get_data") else None
+        if isinstance(data, str):
+            data = data.encode("latin-1")
+        return bytes(data) if data else None
     except Exception:
         return None
 
@@ -1319,6 +1378,36 @@ def _write_pypdf_cmyk_image(image_file, cmyk_pil):
     pdf._objects[ref.idnum - 1] = new
 
 
+def _embedded_to_print_cmyk(pil, model, curves, identity_curves, gains):
+    """嵌入图送入模型后统一写成印刷 CMYK。
+
+    有自带 ICC 时用它转到 sRGB；没有时 CMYK 用 PSOcoated_v3。
+    模型输出再按 PSOcoated_v3 写回 CMYK。只套手工曲线时 CMYK 保持原样套 LUT。
+    """
+    src_mode = pil.mode
+    if model is not None:
+        rgb_np = _pil_to_model_rgb(pil)
+        rgb_np, _ = _apply_curve_content(rgb_np, model, gains=gains)
+        rgb_final = Image.fromarray((np.clip(rgb_np, 0, 1) * 255).astype(np.uint8), "RGB")
+        try:
+            cmyk = _to_cmyk_pil(rgb_final)
+        finally:
+            rgb_final.close()
+    elif src_mode == "CMYK":
+        cmyk = pil.copy()
+    else:
+        rgb_src = pil if src_mode == "RGB" else pil.convert("RGB")
+        cmyk = _to_cmyk_pil(rgb_src)
+        if rgb_src is not pil:
+            rgb_src.close()
+    if not identity_curves:
+        graded = apply_cmyk_curves(cmyk, curves, content_only=False)
+        if graded is not cmyk:
+            cmyk.close()
+            cmyk = graded
+    return cmyk
+
+
 def process_pdf_keep_structure(src, dest, model=None, curves=None, gains=None,
                                raw_cmyk=False):
     """复制输入 PDF 对象树，只替换嵌入图像素。"""
@@ -1346,67 +1435,52 @@ def process_pdf_keep_structure(src, dest, model=None, curves=None, gains=None,
         count = 0
         for image in images:
             cmyk = None
+            src = None
             try:
-                # ★ 首选：绕过 pypdf 的解码器，直接读原始字节
-                raw_pil = _read_embedded_image_raw(image)
-                if raw_pil is not None:
-                    if raw_pil.mode == "CMYK":
-                        cmyk = raw_pil
-                        if not identity_curves:
-                            cmyk = apply_cmyk_curves(cmyk, curves, content_only=False)
-                    elif raw_pil.mode in ("RGB", "L"):
-                        if raw_pil.mode == "L":
-                            rgb_pil = raw_pil.convert("RGB")
-                            raw_pil.close()
-                            raw_pil = rgb_pil
-                        if model is not None:
-                            rgb_np = np.asarray(raw_pil, dtype=np.float32) / 255.0
-                            rgb_np, _ = _apply_curve_content(rgb_np, model, gains=gains)
-                            rgb_final = Image.fromarray(
-                                (np.clip(rgb_np, 0, 1) * 255).astype(np.uint8), "RGB")
-                            cmyk = _to_cmyk_pil(rgb_final)
-                            rgb_final.close()
-                        else:
-                            cmyk = _to_cmyk_pil(raw_pil)
-                        raw_pil.close()
-                        if not identity_curves:
-                            cmyk = apply_cmyk_curves(cmyk, curves, content_only=False)
-
-                # 次选：让 pypdf 解码（已提升限制，可能仍失败）
-                if cmyk is None:
+                src = _read_embedded_image_raw(image)
+                if src is None:
                     try:
-                        pil = image.image
+                        src = image.image
                     except Exception as exc:
                         print(f"   跳过无法解码的嵌入图: {exc}")
                         continue
-                    if pil is None:
-                        print("   跳过 image.image 返回 None 的嵌入图")
-                        continue
-                    rgb = _pil_to_model_rgb(pil)
-                    if model is not None:
-                        rgb, _ = _apply_curve_content(rgb, model, gains=gains)
-                    cmyk = _to_cmyk_pil(
-                        Image.fromarray((np.clip(rgb, 0, 1) * 255).astype(np.uint8), "RGB"))
-                    if not identity_curves:
-                        cmyk = apply_cmyk_curves(cmyk, curves, content_only=False)
-
-                # 尺寸对齐 + 写回
+                if src is None:
+                    print("   跳过 image.image 返回 None 的嵌入图")
+                    continue
+                if not _pil_icc_bytes(src):
+                    icc = _pdf_image_icc_bytes(image)
+                    if icc:
+                        src.info["icc_profile"] = icc
+                src_mode = src.mode
+                cmyk = _embedded_to_print_cmyk(src, model, curves, identity_curves, gains)
                 orig = image.indirect_reference.get_object()
                 orig_w, orig_h = int(orig["/Width"]), int(orig["/Height"])
                 if cmyk.size != (orig_w, orig_h):
-                    cmyk = cmyk.resize((orig_w, orig_h), Image.Resampling.LANCZOS)
+                    resized = cmyk.resize((orig_w, orig_h), Image.Resampling.LANCZOS)
+                    cmyk.close()
+                    cmyk = resized
                 _write_pypdf_cmyk_image(image, cmyk)
                 count += 1
-                print(f"   嵌入图 {orig_w}×{orig_h} 已调色")
+                has_icc = bool(_pil_icc_bytes(src))
+                if model is not None and src_mode == "CMYK":
+                    route = "自带ICC→RGB→模型→CMYK" if has_icc else "PSOcoated_v3→RGB→模型→CMYK"
+                elif model is not None and has_icc:
+                    route = f"{src_mode}自带ICC→模型→CMYK"
+                elif model is not None:
+                    route = f"{src_mode}→模型→CMYK"
+                else:
+                    route = f"{src_mode}→CMYK"
+                print(f"   嵌入图 {orig_w}×{orig_h}（{route}）已调色")
             except Exception as exc:
                 print(f"   跳过无法处理的嵌入图: {exc}")
                 traceback.print_exc()
             finally:
-                try:
-                    if cmyk is not None:
-                        cmyk.close()
-                except Exception:
-                    pass
+                for img in (cmyk, src):
+                    try:
+                        if img is not None:
+                            img.close()
+                    except Exception:
+                        pass
 
         # ★ 关键：一张图都没成功，抛异常触发栅格化降级
         if count == 0:
