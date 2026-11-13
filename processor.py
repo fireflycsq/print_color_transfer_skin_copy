@@ -8,6 +8,8 @@ import traceback
 import uuid
 import zlib
 import inspect
+import threading
+from contextlib import contextmanager
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -475,57 +477,99 @@ def load_model(model_path: str, device: str = None):
 # ICC 转换
 # ============================================================
 
-_CMYK_ICC = os.path.join("utils", "PSOcoated_v3.icc")
+ICC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "utils")
+DEFAULT_CMYK_ICC = os.path.join(ICC_DIR, "PSOcoated_v3.icc")
+_CMYK_ICC = DEFAULT_CMYK_ICC
 _INTENT = ImageCms.Intent.RELATIVE_COLORIMETRIC
 _FLAGS = ImageCms.Flags.BLACKPOINTCOMPENSATION
 
-_srgb_profile = None
-_cmyk_profile = None
-_rgb_to_cmyk = None
-_cmyk_to_rgb = None
+# 同一进程内不同批次可选不同 CMYK ICC：按路径缓存变换，按线程记录当前 ICC
+_icc_cache = {}
+_icc_cache_lock = threading.Lock()
+_icc_local = threading.local()
 
 
-def _init_icc(cmyk_icc_path=_CMYK_ICC):
-    global _srgb_profile, _cmyk_profile, _rgb_to_cmyk, _cmyk_to_rgb
-    if _rgb_to_cmyk is not None:
-        return
-    if not os.path.exists(cmyk_icc_path):
-        raise FileNotFoundError(f"CMYK ICC 不存在: {cmyk_icc_path}")
-    _srgb_profile = ImageCms.createProfile("sRGB")
-    _cmyk_profile = ImageCms.getOpenProfile(cmyk_icc_path)
-    _rgb_to_cmyk = ImageCms.buildTransformFromOpenProfiles(
-        _srgb_profile, _cmyk_profile, "RGB", "CMYK", _INTENT, _FLAGS)
-    _cmyk_to_rgb = ImageCms.buildTransformFromOpenProfiles(
-        _cmyk_profile, _srgb_profile, "CMYK", "RGB", _INTENT, _FLAGS)
+class _IccTransforms:
+    __slots__ = ("path", "description", "rgb_to_cmyk", "cmyk_to_rgb", "data")
+
+    def __init__(self, path):
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"CMYK ICC 不存在: {path}")
+        with open(path, "rb") as f:
+            self.data = f.read()
+        cmyk_profile = ImageCms.ImageCmsProfile(io.BytesIO(self.data))
+        space = (cmyk_profile.profile.xcolor_space or "").strip()
+        if space != "CMYK":
+            raise ValueError(f"ICC 不是 CMYK 输出特性文件（色彩空间: {space or '未知'}）")
+        srgb = ImageCms.createProfile("sRGB")
+        self.path = path
+        self.description = (ImageCms.getProfileDescription(cmyk_profile) or "").strip()
+        self.rgb_to_cmyk = ImageCms.buildTransformFromOpenProfiles(
+            srgb, cmyk_profile, "RGB", "CMYK", _INTENT, _FLAGS)
+        self.cmyk_to_rgb = ImageCms.buildTransformFromOpenProfiles(
+            cmyk_profile, srgb, "CMYK", "RGB", _INTENT, _FLAGS)
+
+
+def load_icc_transforms(cmyk_icc_path):
+    """加载（并缓存）某个 CMYK ICC 的正反向变换；ICC 无效时抛 ValueError。"""
+    key = os.path.abspath(str(cmyk_icc_path))
+    mtime = os.path.getmtime(key) if os.path.exists(key) else None
+    with _icc_cache_lock:
+        cached = _icc_cache.get(key)
+        if cached and cached[0] == mtime:
+            return cached[1]
+    transforms = _IccTransforms(key)
+    with _icc_cache_lock:
+        _icc_cache[key] = (mtime, transforms)
+    return transforms
+
+
+def current_cmyk_icc():
+    return getattr(_icc_local, "path", None) or _CMYK_ICC
+
+
+@contextmanager
+def use_cmyk_icc(cmyk_icc_path):
+    """在当前线程内切换 CMYK ICC：转换、软打样与输出文件内嵌的 ICC 都跟随它。"""
+    path = os.path.abspath(str(cmyk_icc_path or _CMYK_ICC))
+    load_icc_transforms(path)
+    previous = getattr(_icc_local, "path", None)
+    _icc_local.path = path
+    try:
+        yield path
+    finally:
+        _icc_local.path = previous
+
+
+def _init_icc():
+    return load_icc_transforms(current_cmyk_icc())
 
 
 def _read_rgb(path):
-    _init_icc()
+    icc = _init_icc()
     img = Image.open(path)
     if img.mode == "CMYK":
-        img = ImageCms.applyTransform(img, _cmyk_to_rgb)
+        img = ImageCms.applyTransform(img, icc.cmyk_to_rgb)
     else:
         img = img.convert("RGB")
     return np.array(img, dtype=np.float32) / 255.0
 
 
 def _to_cmyk_pil(rgb_pil):
-    _init_icc()
-    return ImageCms.applyTransform(rgb_pil, _rgb_to_cmyk)
+    return ImageCms.applyTransform(rgb_pil, _init_icc().rgb_to_cmyk)
 
 
 def _icc_bytes():
-    if os.path.exists(_CMYK_ICC):
-        with open(_CMYK_ICC, "rb") as f:
-            return f.read()
-    return None
+    try:
+        return _init_icc().data
+    except FileNotFoundError:
+        return None
 
 
 def cmyk_to_srgb(cmyk_pil):
     if cmyk_pil.mode != "CMYK":
         return cmyk_pil.convert("RGB")
-    _init_icc()
-    return ImageCms.applyTransform(cmyk_pil, _cmyk_to_rgb)
+    return ImageCms.applyTransform(cmyk_pil, _init_icc().cmyk_to_rgb)
 
 
 def save_cmyk_image(cmyk_pil, path, fmt=None, lossless=False):
@@ -946,10 +990,9 @@ def iter_source_pages(path, dpi=None):
     if is_pdf(path):
         yield from iter_pdf_pages(path, dpi=dpi)
         return
-    _init_icc()
     with Image.open(path) as img:
         img.load()
-        rgb = ImageCms.applyTransform(img, _cmyk_to_rgb) if img.mode == "CMYK" else img.convert("RGB")
+        rgb = cmyk_to_srgb(img) if img.mode == "CMYK" else img.convert("RGB")
         info_dpi = img.info.get("dpi")
     page_dpi = float(dpi or PDF_DPI)
     try:
@@ -1161,9 +1204,8 @@ def _collect_writer_images(writer):
     return images
 
 def _pil_to_model_rgb(pil):
-    _init_icc()
     if pil.mode == "CMYK":
-        rgb = ImageCms.applyTransform(pil, _cmyk_to_rgb)
+        rgb = cmyk_to_srgb(pil)
     else:
         rgb = pil.convert("RGB")
     return np.asarray(rgb, dtype=np.float32) / 255.0

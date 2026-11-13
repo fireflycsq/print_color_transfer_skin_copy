@@ -65,6 +65,11 @@
 .modal-foot .muted{font-size:11px;margin:0}
 .modal-actions{display:flex;gap:10px;flex-shrink:0}
 .modal-actions .secondary{width:auto;margin:0}
+.icc-row{display:flex;gap:10px;align-items:stretch;margin-top:0}
+.icc-row .select{flex:1;min-width:0}
+.icc-row .button,#reviewIccUpload{width:auto;margin:0;white-space:nowrap;flex-shrink:0}
+label[for=batchIcc]{margin-top:16px}
+#reviewIcc{width:190px}
 @media(max-width:900px){.curve-body{grid-template-columns:1fr}.modal-foot{flex-direction:column;align-items:stretch}
 .review-workspace{grid-template-columns:1fr}.file-panel{position:static}.file-list{max-height:300px}}
 #curvePage{margin-top:8px}

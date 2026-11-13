@@ -19,7 +19,11 @@ const state = {
     curveDiscard: false,
     curvePreviewTimer: null,
     curvePreviewUrl: null,
-    curvePoll: null
+    curvePoll: null,
+    iccProfiles: [],
+    defaultIcc: null,
+    iccUploadTarget: 'batch',   // 'batch'：新建批次用；'review'：当前批次切换并重新渲染
+    reviewPoll: null
 };
 
 function identityCurves() {
@@ -127,7 +131,7 @@ $('#startButton').onclick = async () => {
         const batch = await api('/api/batches', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name })
+            body: JSON.stringify({ name, icc: $('#batchIcc').value || null })
         });
         state.batchId = batch.id;
 
@@ -252,6 +256,7 @@ async function openReview(id) {
         $('#reviewMeta').textContent =
             `${b.target_profile || 'CMYK'} 输出${curveNote} · 创建于 ${new Date(b.created_at).toLocaleString()}`;
         $('#profileName').textContent = b.target_profile || 'CMYK';
+        renderIccSelects();
         $('#downloadButton').href = `/api/batches/${id}/download?status=approved`;
         renderStats(b.counts || {});
         renderReview();
@@ -948,9 +953,10 @@ async function refreshCurvePreview() {
         if (state.curvePreviewUrl) URL.revokeObjectURL(state.curvePreviewUrl);
         state.curvePreviewUrl = URL.createObjectURL(blob);
         $('#curvePreview').src = state.curvePreviewUrl;
+        const profile = state.batch?.target_profile || 'CMYK';
         $('#curveStatus').textContent = curvesAreIdentity(state.curves)
-            ? '当前为交付文件软打样（PSOcoated_v3）'
-            : '已套用曲线（交付文件软打样）';
+            ? `当前为交付文件软打样（${profile}）`
+            : `已套用曲线（交付文件软打样 · ${profile}）`;
     } catch (e) {
         $('#curveStatus').textContent = e.message;
     }
@@ -993,6 +999,118 @@ function pollCurveStatus() {
     }, 1500);
 }
 
+// ---------- CMYK ICC 选择 / 上传 / 整批重新渲染 ----------
+async function loadIccProfiles() {
+    const data = await api('/api/icc-profiles');
+    state.iccProfiles = data.profiles || [];
+    state.defaultIcc = data.default || state.iccProfiles[0]?.id || null;
+    renderIccSelects();
+}
+
+function iccOptionsHtml() {
+    return state.iccProfiles.map(p => {
+        const tags = [p.default ? '默认' : '', p.builtin ? '' : '上传'].filter(Boolean);
+        const label = `${p.name}${tags.length ? `（${tags.join('·')}）` : ''}`;
+        return `<option value="${escapeAttr(p.id)}" title="${escapeAttr(p.description || p.id)}">${escapeHtml(label)}</option>`;
+    }).join('');
+}
+
+function renderIccSelects() {
+    const html = iccOptionsHtml();
+    const batchSelect = $('#batchIcc');
+    const keep = batchSelect.value;
+    batchSelect.innerHTML = html;
+    const ids = state.iccProfiles.map(p => p.id);
+    batchSelect.value = ids.includes(keep) ? keep : (state.defaultIcc || '');
+
+    const reviewSelect = $('#reviewIcc');
+    reviewSelect.innerHTML = html;
+    const current = state.batch?.cmyk_icc || state.defaultIcc;
+    if (current && !ids.includes(current)) {
+        reviewSelect.insertAdjacentHTML('beforeend',
+            `<option value="${escapeAttr(current)}">${escapeHtml(current)}（文件缺失）</option>`);
+    }
+    reviewSelect.value = current || '';
+}
+
+function iccName(id) {
+    return state.iccProfiles.find(p => p.id === id)?.name || id;
+}
+
+async function uploadIccFile(file) {
+    const response = await fetch(`/api/icc-profiles?filename=${encodeURIComponent(file.name)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: file
+    });
+    const data = await response.json().catch(() => null);
+    if (!response.ok) throw new Error(data?.error || 'ICC 上传失败');
+    await loadIccProfiles();
+    return data;
+}
+
+async function switchBatchIcc(iccId) {
+    if (!state.batchId || !state.batch) return;
+    if (!iccId || iccId === state.batch.cmyk_icc) { renderIccSelects(); return; }
+    const total = (state.batch.images || []).length;
+    const ok = confirm(`切换为「${iccName(iccId)}」后，将按原有流程重新处理整批 ${total} 个文件`
+        + '（模型调色 → 新 ICC 转 CMYK → 套用当前曲线），确定？');
+    if (!ok) { renderIccSelects(); return; }
+    try {
+        await api(`/api/batches/${state.batchId}/icc`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ icc: iccId })
+        });
+        toast(`已切换为 ${iccName(iccId)}，正在重新渲染整批…`);
+        await openReview(state.batchId);
+        pollReviewProcessing();
+    } catch (e) {
+        toast(e.message);
+        renderIccSelects();
+    }
+}
+
+function pollReviewProcessing() {
+    clearInterval(state.reviewPoll);
+    const batchId = state.batchId;
+    state.reviewPoll = setInterval(async () => {
+        if (state.batchId !== batchId || !location.hash.startsWith('#review')) {
+            clearInterval(state.reviewPoll);
+            return;
+        }
+        await openReview(batchId);
+        const counts = state.batch?.counts || {};
+        if (!counts.processing) {
+            clearInterval(state.reviewPoll);
+            toast(counts.failed ? `重新渲染完成，${counts.failed} 个失败` : '整批已按新 ICC 重新渲染');
+        }
+    }, 2000);
+}
+
+function initIccControls() {
+    const fileInput = $('#iccFileInput');
+    $('#batchIccUpload').onclick = () => { state.iccUploadTarget = 'batch'; fileInput.click(); };
+    $('#reviewIccUpload').onclick = () => { state.iccUploadTarget = 'review'; fileInput.click(); };
+    $('#reviewIcc').onchange = () => switchBatchIcc($('#reviewIcc').value);
+    fileInput.onchange = async () => {
+        const file = fileInput.files[0];
+        fileInput.value = '';
+        if (!file) return;
+        try {
+            const profile = await uploadIccFile(file);
+            toast(`ICC 已上传：${profile.name}`);
+            if (state.iccUploadTarget === 'review') {
+                await switchBatchIcc(profile.id);
+            } else {
+                $('#batchIcc').value = profile.id;
+            }
+        } catch (e) {
+            toast(e.message);
+        }
+    };
+}
+
 function escapeHtml(s) {
     const d = document.createElement('div');
     d.textContent = s;
@@ -1008,6 +1126,10 @@ async function init() {
         const config = await api('/api/config');
         $('#uploadHint').textContent = `可一次选择多张，单张不超过 ${config.max_upload_mb} MB`;
     } catch (e) { /* 非关键 */ }
+    initIccControls();
+    try {
+        await loadIccProfiles();
+    } catch (e) { toast(`ICC 列表加载失败：${e.message}`); }
     initCurveCanvas();
     $('#curveButton').onclick = openCurveModal;
     loadBatches();
